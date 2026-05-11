@@ -131,8 +131,17 @@ function formatPerplexityResponse(data: PerplexityResponse) {
 
 async function parseJsonResponse(response: Response) {
   const text = await response.text();
+  const contentType = response.headers.get("content-type") ?? "";
+  const jsonText = contentType.includes("text/event-stream")
+    ? text
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trimStart())
+        .join("\n")
+        .trim()
+    : text;
   try {
-    return text ? JSON.parse(text) : {};
+    return jsonText ? JSON.parse(jsonText) : {};
   } catch {
     return { raw: text };
   }
@@ -167,6 +176,7 @@ async function callDeepWikiTool(name: string, args: Record<string, unknown>) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
       "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
     },
     body: JSON.stringify({
