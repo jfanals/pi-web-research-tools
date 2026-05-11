@@ -10,6 +10,8 @@ const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 const PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions";
 const DEEPWIKI_MCP_URL = process.env.DEEPWIKI_MCP_URL ?? "https://mcp.deepwiki.com/mcp";
 const MCP_PROTOCOL_VERSION = "2024-11-05";
+const GOOGLE_SEARCH_MODEL_FALLBACKS = ["gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash"] as const;
+type GoogleSearchModel = (typeof GOOGLE_SEARCH_MODEL_FALLBACKS)[number];
 
 type TextResultDetails = {
   query?: string;
@@ -136,6 +138,30 @@ async function parseJsonResponse(response: Response) {
   }
 }
 
+function getGoogleSearchModelFallbacks(model?: "flash" | "pro" | "gemini-3-flash"): GoogleSearchModel[] {
+  if (model === "pro") return ["gemini-2.5-pro", "gemini-2.5-flash"];
+  if (model === "flash") return ["gemini-2.5-flash"];
+  return [...GOOGLE_SEARCH_MODEL_FALLBACKS];
+}
+
+async function generateGeminiSearchContent(modelName: GoogleSearchModel, query: string, signal?: AbortSignal) {
+  const response = await fetch(`${GEMINI_API_URL}/${modelName}:generateContent?key=${GOOGLE_API_KEY}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: query }] }],
+      tools: [{ google_search: {} }],
+    }),
+    signal,
+  });
+  const data = (await parseJsonResponse(response)) as GeminiResponse & { raw?: string };
+  return { response, data };
+}
+
+function getGeminiErrorMessage(data: GeminiResponse & { raw?: string }): string {
+  return data.error?.message ?? (typeof data.raw === "string" ? data.raw : JSON.stringify(data));
+}
+
 async function callDeepWikiTool(name: string, args: Record<string, unknown>) {
   const response = await fetch(DEEPWIKI_MCP_URL, {
     method: "POST",
@@ -178,11 +204,11 @@ export default function webResearchExtension(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       query: Type.String({ description: "The search query or question to research on the web" }),
-      model: Type.Optional(StringEnum(["flash", "pro"] as const, { description: 'Model to use: "flash" or "pro". Default: flash.' })),
+      model: Type.Optional(StringEnum(["gemini-3-flash", "pro", "flash"] as const, { description: 'Model to use. Default: gemini-3-flash-preview, with fallback to gemini-2.5-pro then gemini-2.5-flash.' })),
     }),
     renderCall(args, theme) {
-      const modelName = args.model === "pro" ? "gemini-2.5-pro" : "gemini-2.5-flash";
-      return new Text(renderQuery(theme, "google", args.query, `search (${modelName})`), 0, 0);
+      const modelNames = getGoogleSearchModelFallbacks(args.model);
+      return new Text(renderQuery(theme, "google", args.query, `search (${modelNames.join(" → ")})`), 0, 0);
     },
     renderResult(result, { expanded }, theme) {
       const details = result.details as TextResultDetails | undefined;
@@ -193,36 +219,35 @@ export default function webResearchExtension(pi: ExtensionAPI) {
       return renderPreview(answer, expanded, theme);
     },
     async execute(_toolCallId, params, signal, onUpdate) {
-      const modelName = params.model === "pro" ? "gemini-2.5-pro" : "gemini-2.5-flash";
+      const modelNames = getGoogleSearchModelFallbacks(params.model);
       if (!GOOGLE_API_KEY) {
-        return errorResult({ query: params.query, model: modelName, error: true }, "Error: GOOGLE_API_KEY environment variable is not set.");
+        return errorResult({ query: params.query, model: modelNames[0], error: true }, "Error: GOOGLE_API_KEY environment variable is not set.");
       }
-      onUpdate?.({ content: [{ type: "text", text: "Searching..." }], details: { query: params.query, model: modelName } });
-      try {
-        const response = await fetch(`${GEMINI_API_URL}/${modelName}:generateContent?key=${GOOGLE_API_KEY}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts: [{ text: params.query }] }],
-            tools: [{ google_search: {} }],
-          }),
-          signal,
-        });
-        const data = (await parseJsonResponse(response)) as GeminiResponse & { raw?: string };
-        if (!response.ok) {
-          return errorResult(
-            { query: params.query, model: modelName, error: true, status: response.status },
-            `Error: Gemini API returned ${response.status}: ${typeof data.raw === "string" ? data.raw : JSON.stringify(data)}`,
-          );
+      onUpdate?.({ content: [{ type: "text", text: "Searching..." }], details: { query: params.query, model: modelNames.join(" → ") } });
+      const errors: string[] = [];
+      for (const modelName of modelNames) {
+        try {
+          const { response, data } = await generateGeminiSearchContent(modelName, params.query, signal);
+          if (!response.ok) {
+            errors.push(`${modelName}: ${response.status} ${getGeminiErrorMessage(data)}`);
+            continue;
+          }
+          if (data.error?.message) {
+            errors.push(`${modelName}: ${data.error.message}`);
+            continue;
+          }
+          const formatted = formatGeminiResponse(data);
+          return successResult(formatted.text, { query: params.query, model: modelName, sources: formatted.sources, usage: data.usageMetadata });
+        } catch (error) {
+          if (signal?.aborted) return successResult("Search cancelled", { query: params.query, model: modelName, cancelled: true });
+          const message = error instanceof Error ? error.message : String(error);
+          errors.push(`${modelName}: ${message}`);
         }
-        if (data.error?.message) return errorResult({ query: params.query, model: modelName, error: true, message: data.error.message }, `Gemini API error: ${data.error.message}`);
-        const formatted = formatGeminiResponse(data);
-        return successResult(formatted.text, { query: params.query, model: modelName, sources: formatted.sources, usage: data.usageMetadata });
-      } catch (error) {
-        if (signal.aborted) return successResult("Search cancelled", { query: params.query, model: modelName, cancelled: true });
-        const message = error instanceof Error ? error.message : String(error);
-        return errorResult({ query: params.query, model: modelName, error: true, message }, `Google Search error: ${message}`);
       }
+      return errorResult(
+        { query: params.query, model: modelNames.join(" → "), error: true, message: errors.join("; ") },
+        `Google Search error: all Gemini models failed. ${errors.join("; ")}`,
+      );
     },
   });
 
